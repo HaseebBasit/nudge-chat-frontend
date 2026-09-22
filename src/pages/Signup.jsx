@@ -9,16 +9,28 @@ export default function Signup() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
   const { pushToast } = useToast();
   const navigate = useNavigate();
 
   async function handleSubmit(e) {
     e.preventDefault();
     setSubmitting(true);
+
     try {
-      const { data } = await api.post("/auth/signup", { name, email, password });
+      const { data } = await api.post("/auth/signup", {
+        name,
+        email,
+        password,
+      });
+
       pushToast("OTP sent to your email", "success");
-      navigate("/verify-email", { state: { email: data.email } });
+
+      navigate("/verify-email", {
+        state: {
+          email: data.email,
+        },
+      });
     } catch (error) {
       pushToast(apiErrorMessage(error), "error");
     } finally {
@@ -27,7 +39,10 @@ export default function Signup() {
   }
 
   return (
-    <AuthLayout title="Create your account" subtitle="One email, one account — verified in under a minute.">
+    <AuthLayout
+      title="Create your account"
+      subtitle="One email, one account — verified in under a minute."
+    >
       <form className="auth-form" onSubmit={handleSubmit}>
         <label className="field-label">
           Full name
@@ -65,7 +80,11 @@ export default function Signup() {
           />
         </label>
 
-        <button className="btn btn-primary btn-block" type="submit" disabled={submitting}>
+        <button
+          className="btn btn-primary btn-block"
+          type="submit"
+          disabled={submitting}
+        >
           {submitting ? "Creating account…" : "Create account"}
         </button>
       </form>
@@ -76,3 +95,4 @@ export default function Signup() {
     </AuthLayout>
   );
 }
+

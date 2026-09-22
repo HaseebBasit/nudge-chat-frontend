@@ -9,6 +9,7 @@ export default function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
   const { login } = useAuth();
   const { pushToast } = useToast();
   const navigate = useNavigate();
@@ -16,17 +17,34 @@ export default function Login() {
   async function handleSubmit(e) {
     e.preventDefault();
     setSubmitting(true);
+
     try {
-      const { data } = await api.post("/auth/login", { email, password });
+      const { data } = await api.post("/auth/login", {
+        email,
+        password,
+      });
+
       login(data.token, data.user);
-      pushToast(`Welcome back, ${data.user.name.split(" ")[0]}`, "success");
+
+      pushToast(
+        `Welcome back, ${data.user.name.split(" ")[0]}`,
+        "success"
+      );
+
       navigate("/dashboard");
     } catch (error) {
       if (error?.response?.data?.needsVerification) {
         pushToast("Please verify your email first", "info");
-        navigate("/verify-email", { state: { email: error.response.data.email } });
+
+        navigate("/verify-email", {
+          state: {
+            email: error.response.data.email,
+          },
+        });
+
         return;
       }
+
       pushToast(apiErrorMessage(error), "error");
     } finally {
       setSubmitting(false);
@@ -34,7 +52,10 @@ export default function Login() {
   }
 
   return (
-    <AuthLayout title="Log in to your account" subtitle="Pick up right where the conversation left off.">
+    <AuthLayout
+      title="Log in to your account"
+      subtitle="Pick up right where the conversation left off."
+    >
       <form className="auth-form" onSubmit={handleSubmit}>
         <label className="field-label">
           Email
@@ -66,7 +87,11 @@ export default function Login() {
           </Link>
         </div>
 
-        <button className="btn btn-primary btn-block" type="submit" disabled={submitting}>
+        <button
+          className="btn btn-primary btn-block"
+          type="submit"
+          disabled={submitting}
+        >
           {submitting ? "Logging in…" : "Log in"}
         </button>
       </form>
