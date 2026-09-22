@@ -1,14 +1,21 @@
-import React, { useEffect, useRef, useState } from "react";
-import { io } from "socket.io-client";
-import "./index.css";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { useAuth } from "../context/AuthContext.jsx";
+import { useToast } from "../context/ToastContext.jsx";
+import { getSocket, destroySocket } from "../lib/socket.js";
+import api, { apiErrorMessage } from "../lib/api.js";
+import ConfirmModal from "../components/ConfirmModal.jsx";
 
-const BACKEND_URL =
-  import.meta.env.VITE_API_URL ||
-  "https://nudge-chat-backend.onrender.com";
+function formatTime(iso) {
+  if (!iso) return "";
 
-const SOCKET_URL =
-  import.meta.env.VITE_SOCKET_URL ||
-  BACKEND_URL;
+  const d = new Date(iso);
+
+  return d.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 
 function Tick({ delivery, isOwn }) {
   if (!isOwn) return null;
@@ -27,203 +34,284 @@ function Tick({ delivery, isOwn }) {
   return <span className="tick tick-sent">✓</span>;
 }
 
-export default function Chat({ user, onLogout }) {
-  const socketRef = useRef(null);
-  const typingTimeoutRef = useRef(null);
-  const notificationAudioRef = useRef(null);
+export default function Chat() {
+  const { user, logout } = useAuth();
+  const { pushToast } = useToast();
+  const navigate = useNavigate();
 
   const [messages, setMessages] = useState([]);
-  const [message, setMessage] = useState("");
-  const [editingId, setEditingId] = useState(null);
-  const [editText, setEditText] = useState("");
-
-  const [deleteTarget, setDeleteTarget] = useState(null);
-  const [infoTarget, setInfoTarget] = useState(null);
-
+  const [loading, setLoading] = useState(true);
   const [onlineUsers, setOnlineUsers] = useState([]);
   const [typingUsers, setTypingUsers] = useState([]);
+  const [input, setInput] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const [connected, setConnected] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [editingId, setEditingId] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [infoTarget, setInfoTarget] = useState(null);
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
 
-  const messageListRef = useRef(null);
+  const socketRef = useRef(null);
+  const manualDisconnectRef = useRef(false);
+  const typingTimeoutRef = useRef(null);
+  const isTypingRef = useRef(false);
+  const bottomRef = useRef(null);
 
+  // ------------------------------------------------
+  // Load history + connect socket
+  // ------------------------------------------------
   useEffect(() => {
-    const token = localStorage.getItem("token");
+    let cancelled = false;
 
-    if (!token) {
-      onLogout();
-      return;
+    async function loadHistory() {
+      try {
+        const { data } = await api.get("/messages");
+
+        if (!cancelled) {
+          setMessages(data);
+        }
+      } catch (error) {
+        pushToast(apiErrorMessage(error), "error");
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
     }
 
-    const socket = io(SOCKET_URL, {
-      auth: {
-        token,
-      },
-      transports: ["websocket", "polling"],
-    });
+    loadHistory();
+
+    const socket = getSocket();
 
     socketRef.current = socket;
+    manualDisconnectRef.current = false;
 
-    socket.on("connect", () => {
-      setConnected(true);
+    const token = localStorage.getItem("nudge_token");
 
-      socket.emit("join_chat", {
-        token,
-      });
+    socket.connect();
+
+    socket.emit("join_chat", {
+      token,
     });
 
-    socket.on("disconnect", () => {
-      setConnected(false);
+    socket.on("online_users", (names) => {
+      setOnlineUsers(names);
     });
 
-    socket.on("connect_error", (error) => {
-      console.error("Socket connection error:", error);
-      setConnected(false);
-    });
+    socket.on("receive_message", (msg) => {
+      setMessages((prev) => [...prev, msg]);
 
-    socket.on("chat_history", (history) => {
-      setMessages(history || []);
-      setLoading(false);
-
-      setTimeout(() => {
-        scrollToBottom();
-      }, 100);
-    });
-
-    socket.on("message_received", (newMessage) => {
-      setMessages((prev) => {
-        const exists = prev.some((msg) => msg.id === newMessage.id);
-
-        if (exists) {
-          return prev;
-        }
-
-        return [...prev, newMessage];
-      });
-
-      setTimeout(() => {
-        scrollToBottom();
-      }, 50);
-
-      if (newMessage.sender_id !== user?.id) {
-        try {
-          notificationAudioRef.current?.play();
-        } catch {
-          // Ignore browser autoplay restrictions
-        }
+      if (msg.sender_name !== user?.name) {
+        socket.emit("mark_seen", {
+          id: msg.id,
+        });
       }
     });
 
-    socket.on("message_updated", (updatedMessage) => {
-      setMessages((prev) =>
-        prev.map((msg) =>
-          msg.id === updatedMessage.id ? updatedMessage : msg
-        )
-      );
-    });
+    socket.on(
+      "message_delivery_update",
+      ({ message_id, ...info }) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === message_id
+              ? {
+                  ...m,
+                  delivery_info: info,
+                }
+              : m
+          )
+        );
+      }
+    );
 
-    socket.on("message_deleted", ({ id, deleted_by }) => {
+    socket.on("message_edited", (updated) => {
       setMessages((prev) =>
-        prev.map((msg) =>
-          msg.id === id
+        prev.map((m) =>
+          m.id === updated.id
             ? {
-                ...msg,
-                deleted: true,
-                deleted_by,
-                message: "",
+                ...m,
+                ...updated,
               }
-            : msg
+            : m
         )
       );
     });
 
-    socket.on("message_delivery_updated", (updatedMessage) => {
+    socket.on("message_deleted", (updated) => {
       setMessages((prev) =>
-        prev.map((msg) =>
-          msg.id === updatedMessage.id
+        prev.map((m) =>
+          m.id === updated.id
             ? {
-                ...msg,
-                delivery_info: updatedMessage.delivery_info,
+                ...m,
+                ...updated,
               }
-            : msg
+            : m
         )
       );
     });
 
-    socket.on("online_users", (users) => {
-      setOnlineUsers(users || []);
-    });
+    socket.on("user_typing", ({ name }) => {
+      if (name === user?.name) return;
 
-    socket.on("user_typing", ({ userId, userName }) => {
-      if (userId === user?.id) return;
-
-      setTypingUsers((prev) => {
-        const exists = prev.some((u) => u.userId === userId);
-
-        if (exists) return prev;
-
-        return [...prev, { userId, userName }];
-      });
-    });
-
-    socket.on("user_stop_typing", ({ userId }) => {
       setTypingUsers((prev) =>
-        prev.filter((u) => u.userId !== userId)
+        prev.includes(name)
+          ? prev
+          : [...prev, name]
       );
+    });
+
+    socket.on("user_stop_typing", ({ name }) => {
+      setTypingUsers((prev) =>
+        prev.filter((n) => n !== name)
+      );
+    });
+
+    socket.on("auth_error", () => {
+      handleSessionExpired();
+    });
+
+    socket.on("disconnect", () => {
+      if (manualDisconnectRef.current) return;
+
+      handleSessionExpired();
     });
 
     return () => {
-      socket.removeAllListeners();
+      cancelled = true;
+      manualDisconnectRef.current = true;
+
+      socket.off("online_users");
+      socket.off("receive_message");
+      socket.off("message_delivery_update");
+      socket.off("message_edited");
+      socket.off("message_deleted");
+      socket.off("user_typing");
+      socket.off("user_stop_typing");
+      socket.off("auth_error");
+      socket.off("disconnect");
+
+      // Leaving the chat page without logging out
+      // disconnect cleanly so the online users list updates.
       socket.disconnect();
-      socketRef.current = null;
     };
-  }, [user?.id, onLogout]);
 
-  function scrollToBottom() {
-    if (!messageListRef.current) return;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    messageListRef.current.scrollTop =
-      messageListRef.current.scrollHeight;
-  }
+  // ------------------------------------------------
+  // Mark existing unseen messages as seen
+  // ------------------------------------------------
+  useEffect(() => {
+    if (loading || !socketRef.current) return;
 
-  function sendMessage(e) {
-    e.preventDefault();
-
-    const trimmed = message.trim();
-
-    if (!trimmed) return;
-    if (!socketRef.current) return;
-
-    socketRef.current.emit("send_message", {
-      message: trimmed,
+    messages.forEach((m) => {
+      if (
+        m.sender_name !== user?.name &&
+        !m.deleted
+      ) {
+        socketRef.current.emit("mark_seen", {
+          id: m.id,
+        });
+      }
     });
 
-    setMessage("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading]);
 
-    socketRef.current.emit("stop_typing");
+  // ------------------------------------------------
+  // Scroll to bottom
+  // ------------------------------------------------
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({
+      behavior: "smooth",
+    });
+  }, [messages.length, typingUsers.length]);
 
-    setTimeout(() => {
-      scrollToBottom();
-    }, 50);
+  // ------------------------------------------------
+  // Session expired
+  // ------------------------------------------------
+  function handleSessionExpired() {
+    manualDisconnectRef.current = true;
+
+    pushToast(
+      "Session expired, please log in again",
+      "error"
+    );
+
+    destroySocket();
+    logout();
+    navigate("/login");
   }
 
-  function handleTyping(e) {
-    const value = e.target.value;
+  // ------------------------------------------------
+  // Compose + typing
+  // ------------------------------------------------
+  function handleInputChange(e) {
+    const val = e.target.value;
 
-    setMessage(value);
+    setInput(val);
 
-    if (!socketRef.current) return;
+    const socket = socketRef.current;
 
-    socketRef.current.emit("typing");
+    if (!socket) return;
+
+    if (
+      val.trim() &&
+      !isTypingRef.current
+    ) {
+      isTypingRef.current = true;
+
+      socket.emit("typing", {
+        name: user.name,
+      });
+    }
 
     clearTimeout(typingTimeoutRef.current);
 
     typingTimeoutRef.current = setTimeout(() => {
-      socketRef.current?.emit("stop_typing");
-    }, 800);
+      isTypingRef.current = false;
+
+      socket.emit("stop_typing", {
+        name: user.name,
+      });
+    }, 1500);
+
+    if (!val.trim()) {
+      isTypingRef.current = false;
+
+      socket.emit("stop_typing", {
+        name: user.name,
+      });
+    }
   }
 
+  function handleSend(e) {
+    e.preventDefault();
+
+    const text = input.trim();
+
+    if (!text) return;
+
+    socketRef.current?.emit("send_message", {
+      sender_name: user.name,
+      message: text,
+    });
+
+    setInput("");
+
+    clearTimeout(typingTimeoutRef.current);
+
+    isTypingRef.current = false;
+
+    socketRef.current?.emit("stop_typing", {
+      name: user.name,
+    });
+  }
+
+  // ------------------------------------------------
+  // Edit
+  // ------------------------------------------------
   function startEdit(msg) {
     setEditingId(msg.id);
     setEditText(msg.message);
@@ -237,172 +325,157 @@ export default function Chat({ user, onLogout }) {
   function saveEdit(e) {
     e.preventDefault();
 
-    const trimmed = editText.trim();
+    const text = editText.trim();
 
-    if (!trimmed) return;
+    if (!text) return;
 
     socketRef.current?.emit("edit_message", {
       id: editingId,
-      message: trimmed,
+      message: text,
+      sender_name: user.name,
     });
 
-    cancelEdit();
+    setEditingId(null);
+    setEditText("");
   }
 
+  // ------------------------------------------------
+  // Delete
+  // ------------------------------------------------
   function confirmDelete() {
-    if (!deleteTarget) return;
-
     socketRef.current?.emit("delete_message", {
       id: deleteTarget,
+      sender_name: user.name,
     });
 
     setDeleteTarget(null);
   }
 
-  function formatTime(date) {
-    if (!date) return "";
+  // ------------------------------------------------
+  // Logout
+  // ------------------------------------------------
+  function handleLogout() {
+    manualDisconnectRef.current = true;
 
-    return new Date(date).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    destroySocket();
+
+    logout();
+
+    setLogoutConfirmOpen(false);
+
+    pushToast("Logged out", "info");
+
+    navigate("/login");
   }
 
-  function getInitials(name) {
-    if (!name) return "?";
-
-    return name
-      .split(" ")
-      .map((part) => part[0])
-      .join("")
-      .slice(0, 2)
-      .toUpperCase();
-  }
-
-  const currentUserId = user?.id;
+  const infoMessage = useMemo(
+    () =>
+      messages.find(
+        (m) => m.id === infoTarget
+      ),
+    [messages, infoTarget]
+  );
 
   return (
     <div className="chat-shell">
-      <audio
-        ref={notificationAudioRef}
-        preload="auto"
-        src="/notification.mp3"
-      />
+      {/* ================================
+          TOP BAR
+      ================================= */}
 
       <header className="chat-topbar">
         <div className="chat-brand">
-          <div className="brand-mark">N</div>
-
-          <div>
-            <div className="brand-name">Nudge</div>
-            <div className="brand-status">
-              {connected ? "Connected" : "Connecting..."}
-            </div>
-          </div>
+          <span className="brand-dot" />
+          Nudge
         </div>
 
-        <div className="chat-user">
-          <div className="user-avatar">
-            {getInitials(user?.name)}
-          </div>
+        <button
+          className="online-pill"
+          onClick={() =>
+            setSidebarOpen((o) => !o)
+          }
+        >
+          <span className="status-dot online" />
 
-          <div className="user-details">
-            <strong>{user?.name}</strong>
-            <span>{user?.email}</span>
-          </div>
+          {onlineUsers.length} online
+        </button>
 
-          <button className="logout-btn" onClick={onLogout}>
+        <div className="chat-topbar-right">
+          <span className="you-as">
+            You as <strong>{user?.name}</strong>
+          </span>
+
+          <button
+            className="btn btn-outline btn-sm"
+            onClick={() =>
+              setLogoutConfirmOpen(true)
+            }
+          >
             Logout
           </button>
         </div>
       </header>
 
+      {/* ================================
+          CHAT BODY
+      ================================= */}
+
       <div className="chat-body">
-        <aside className="chat-sidebar">
-          <div className="sidebar-header">
-            <h3>People</h3>
-            <span>{onlineUsers.length} online</span>
-          </div>
+        {/* SIDEBAR */}
 
-          <div className="online-list">
-            {onlineUsers.length === 0 ? (
-              <div className="empty-online">
-                No one is online
-              </div>
-            ) : (
-              onlineUsers.map((onlineUser) => (
-                <div
-                  className="online-user"
-                  key={onlineUser.id || onlineUser.userId}
-                >
-                  <div className="online-avatar">
-                    {getInitials(
-                      onlineUser.name || onlineUser.userName
-                    )}
-                    <span className="online-dot" />
-                  </div>
+        <aside
+          className={`chat-sidebar ${
+            sidebarOpen ? "open" : ""
+          }`}
+        >
+          <h4>Online now</h4>
 
-                  <div className="online-user-info">
-                    <strong>
-                      {onlineUser.name ||
-                        onlineUser.userName ||
-                        "User"}
-                    </strong>
-                    <span>Online</span>
-                  </div>
-                </div>
-              ))
+          <ul className="online-list">
+            {onlineUsers.map((name) => (
+              <li key={name}>
+                <span className="avatar-mini">
+                  {name[0]?.toUpperCase()}
+                </span>
+
+                {name}
+
+                {name === user?.name && (
+                  <span className="you-tag">
+                    you
+                  </span>
+                )}
+              </li>
+            ))}
+
+            {onlineUsers.length === 0 && (
+              <li className="muted">
+                No one online
+              </li>
             )}
-          </div>
+          </ul>
         </aside>
 
+        {/* MAIN CHAT */}
+
         <main className="chat-main">
-          <div className="chat-main-header">
-            <div>
-              <h2>General Chat</h2>
-              <p>Talk with everyone on Nudge</p>
-            </div>
-
-            <div
-              className={`connection-status ${
-                connected ? "connected" : ""
-              }`}
-            >
-              <span />
-              {connected ? "Live" : "Offline"}
-            </div>
-          </div>
-
-          <div className="message-list" ref={messageListRef}>
-            {loading ? (
-              <div className="chat-loading">
-                Loading messages...
+          <div className="message-list">
+            {loading && (
+              <div className="muted center-pad">
+                Loading messages…
               </div>
-            ) : messages.length === 0 ? (
-              <div className="chat-empty">
-                <div className="empty-icon">💬</div>
-                <h3>No messages yet</h3>
-                <p>Start the conversation.</p>
-              </div>
-            ) : (
+            )}
+
+            {!loading &&
               messages.map((msg) => {
                 const isOwn =
-                  msg.sender_id === currentUserId ||
-                  msg.user_id === currentUserId;
+                  msg.sender_name === user?.name;
 
                 return (
                   <div
                     key={msg.id}
                     className={`message-row ${
-                      isOwn ? "own" : "other"
+                      isOwn ? "own" : ""
                     }`}
                   >
-                    {!isOwn && (
-                      <div className="message-avatar">
-                        {getInitials(msg.sender_name)}
-                      </div>
-                    )}
-
                     <div className="message-bubble">
                       {!isOwn && (
                         <div className="bubble-sender">
@@ -410,32 +483,44 @@ export default function Chat({ user, onLogout }) {
                         </div>
                       )}
 
+                      {/* MESSAGE CONTENT */}
+
                       {msg.deleted ? (
                         <div className="bubble-deleted">
-                          Deleted by {msg.deleted_by}
+                          Deleted by{" "}
+                          {msg.deleted_by}
                         </div>
-                      ) : editingId === msg.id ? (
+                      ) : editingId ===
+                        msg.id ? (
                         <form
                           className="edit-form"
                           onSubmit={saveEdit}
                         >
                           <input
+                            autoFocus
                             value={editText}
                             onChange={(e) =>
-                              setEditText(e.target.value)
+                              setEditText(
+                                e.target.value
+                              )
                             }
-                            autoFocus
                           />
 
                           <div className="edit-actions">
                             <button
                               type="button"
-                              onClick={cancelEdit}
+                              className="btn btn-ghost btn-xs"
+                              onClick={
+                                cancelEdit
+                              }
                             >
                               Cancel
                             </button>
 
-                            <button type="submit">
+                            <button
+                              type="submit"
+                              className="btn btn-primary btn-xs"
+                            >
                               Save
                             </button>
                           </div>
@@ -445,6 +530,8 @@ export default function Chat({ user, onLogout }) {
                           {msg.message}
                         </div>
                       )}
+
+                      {/* MESSAGE META + ACTION BUTTONS */}
 
                       {!msg.deleted && (
                         <div className="bubble-meta">
@@ -456,92 +543,121 @@ export default function Chat({ user, onLogout }) {
 
                           <button
                             className="meta-time"
+                            type="button"
                             onClick={() =>
-                              isOwn && setInfoTarget(msg.id)
+                              isOwn &&
+                              setInfoTarget(
+                                msg.id
+                              )
                             }
                           >
-                            {formatTime(msg.created_at)}
+                            {formatTime(
+                              msg.created_at
+                            )}
                           </button>
 
                           {isOwn && (
-                            <button
-                              className="message-info-btn"
-                              onClick={() =>
-                                setInfoTarget(msg.id)
-                              }
-                              title="Message info"
-                              type="button"
-                            >
-                              ⓘ
-                            </button>
+                            <>
+                              {/* INFO / SEEN BUTTON */}
+
+                              <button
+                                className="message-action-btn"
+                                type="button"
+                                title="Message info"
+                                onClick={() =>
+                                  setInfoTarget(
+                                    msg.id
+                                  )
+                                }
+                              >
+                                ⓘ
+                              </button>
+
+                              {/* EDIT BUTTON */}
+
+                              {editingId !==
+                                msg.id && (
+                                <button
+                                  className="message-action-btn"
+                                  type="button"
+                                  title="Edit message"
+                                  onClick={() =>
+                                    startEdit(msg)
+                                  }
+                                >
+                                  Edit
+                                </button>
+                              )}
+
+                              {/* DELETE BUTTON */}
+
+                              {editingId !==
+                                msg.id && (
+                                <button
+                                  className="message-action-btn message-delete-btn"
+                                  type="button"
+                                  title="Delete message"
+                                  onClick={() =>
+                                    setDeleteTarget(
+                                      msg.id
+                                    )
+                                  }
+                                >
+                                  Delete
+                                </button>
+                              )}
+                            </>
                           )}
 
                           <Tick
-                            delivery={msg.delivery_info}
+                            delivery={
+                              msg.delivery_info
+                            }
                             isOwn={isOwn}
                           />
                         </div>
                       )}
-
-                      {isOwn &&
-                        !msg.deleted &&
-                        editingId !== msg.id && (
-                          <div className="bubble-hover-actions">
-                            <button
-                              type="button"
-                              onClick={() => startEdit(msg)}
-                              title="Edit message"
-                            >
-                              Edit
-                            </button>
-
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setDeleteTarget(msg.id)
-                              }
-                              title="Delete message"
-                            >
-                              Delete
-                            </button>
-                          </div>
-                        )}
                     </div>
                   </div>
                 );
-              })
-            )}
+              })}
 
-            {typingUsers.length > 0 && (
-              <div className="typing-indicator">
-                <div className="typing-dots">
-                  <span />
-                  <span />
-                  <span />
-                </div>
-
-                <span>
-                  {typingUsers.length === 1
-                    ? `${typingUsers[0].userName} is typing...`
-                    : "Someone is typing..."}
-                </span>
-              </div>
-            )}
+            <div ref={bottomRef} />
           </div>
 
-          <form className="composer" onSubmit={sendMessage}>
+          {/* TYPING */}
+
+          {typingUsers.length > 0 && (
+            <div className="typing-indicator">
+              <span className="mock-dot" />
+              <span className="mock-dot" />
+              <span className="mock-dot" />
+
+              {typingUsers.join(", ")}{" "}
+              {typingUsers.length === 1
+                ? "is"
+                : "are"}{" "}
+              typing
+            </div>
+          )}
+
+          {/* COMPOSER */}
+
+          <form
+            className="composer"
+            onSubmit={handleSend}
+          >
             <input
-              type="text"
-              value={message}
-              onChange={handleTyping}
-              placeholder="Write a message..."
-              disabled={!connected}
+              value={input}
+              onChange={handleInputChange}
+              placeholder="Type a message"
+              autoComplete="off"
             />
 
             <button
-              className="send-btn"
+              className="btn btn-primary"
               type="submit"
-              disabled={!connected || !message.trim()}
+              disabled={!input.trim()}
             >
               Send
             </button>
@@ -549,98 +665,103 @@ export default function Chat({ user, onLogout }) {
         </main>
       </div>
 
-      {deleteTarget && (
+      {/* ================================
+          MESSAGE INFO MODAL
+      ================================= */}
+
+      {infoMessage && (
         <div
           className="modal-backdrop"
-          onClick={() => setDeleteTarget(null)}
+          onClick={() =>
+            setInfoTarget(null)
+          }
         >
           <div
-            className="modal"
-            onClick={(e) => e.stopPropagation()}
+            className="modal-card"
+            onClick={(e) =>
+              e.stopPropagation()
+            }
           >
-            <div className="modal-icon danger">!</div>
+            <h3 className="modal-title">
+              Message info
+            </h3>
 
-            <h3>Delete message?</h3>
+            <div className="info-section">
+              <h5>
+                Delivered to (
+                {infoMessage.delivery_info
+                  ?.delivered_count || 0}
+                )
+              </h5>
 
-            <p>
-              This message will be removed for everyone.
-            </p>
+              {(
+                infoMessage.delivery_info
+                  ?.delivered_to || []
+              ).map((r) => (
+                <div
+                  key={r.id}
+                  className="info-row"
+                >
+                  <span>{r.user_name}</span>
 
-            <div className="modal-actions">
-              <button
-                className="btn btn-secondary"
-                onClick={() => setDeleteTarget(null)}
-              >
-                Cancel
-              </button>
-
-              <button
-                className="btn btn-danger"
-                onClick={confirmDelete}
-              >
-                Delete
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {infoTarget && (
-        <div
-          className="modal-backdrop"
-          onClick={() => setInfoTarget(null)}
-        >
-          <div
-            className="modal info-modal"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="modal-icon">ⓘ</div>
-
-            <h3>Message info</h3>
-
-            {(() => {
-              const infoMessage = messages.find(
-                (msg) => msg.id === infoTarget
-              );
-
-              const delivery = infoMessage?.delivery_info;
-
-              return (
-                <div className="message-info">
-                  <div className="info-row">
-                    <span>Sent</span>
-                    <strong>
-                      {infoMessage
-                        ? formatTime(infoMessage.created_at)
-                        : "-"}
-                    </strong>
-                  </div>
-
-                  <div className="info-row">
-                    <span>Delivered</span>
-                    <strong>
-                      {delivery?.delivered_count > 0
-                        ? "✓ Delivered"
-                        : "Not delivered"}
-                    </strong>
-                  </div>
-
-                  <div className="info-row">
-                    <span>Seen</span>
-                    <strong>
-                      {delivery?.seen_count > 0
-                        ? "✓✓ Seen"
-                        : "Not seen"}
-                    </strong>
-                  </div>
+                  <span className="muted">
+                    {formatTime(
+                      r.delivered_at
+                    )}
+                  </span>
                 </div>
-              );
-            })()}
+              ))}
+
+              {(
+                infoMessage.delivery_info
+                  ?.delivered_to || []
+              ).length === 0 && (
+                <p className="muted">
+                  Not delivered yet
+                </p>
+              )}
+            </div>
+
+            <div className="info-section">
+              <h5>
+                Seen by (
+                {infoMessage.delivery_info
+                  ?.seen_count || 0}
+                )
+              </h5>
+
+              {(
+                infoMessage.delivery_info
+                  ?.seen_by || []
+              ).map((r) => (
+                <div
+                  key={r.id}
+                  className="info-row"
+                >
+                  <span>{r.user_name}</span>
+
+                  <span className="muted">
+                    {formatTime(r.seen_at)}
+                  </span>
+                </div>
+              ))}
+
+              {(
+                infoMessage.delivery_info
+                  ?.seen_by || []
+              ).length === 0 && (
+                <p className="muted">
+                  No one has seen this yet
+                </p>
+              )}
+            </div>
 
             <div className="modal-actions">
               <button
-                className="btn btn-secondary"
-                onClick={() => setInfoTarget(null)}
+                className="btn btn-primary"
+                onClick={() =>
+                  setInfoTarget(null)
+                }
               >
                 Close
               </button>
@@ -648,6 +769,38 @@ export default function Chat({ user, onLogout }) {
           </div>
         </div>
       )}
+
+      {/* ================================
+          DELETE CONFIRM
+      ================================= */}
+
+      <ConfirmModal
+        open={Boolean(deleteTarget)}
+        title="Delete this message?"
+        description="This can't be undone. Everyone in the chat will see that it was deleted."
+        confirmLabel="Delete"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() =>
+          setDeleteTarget(null)
+        }
+      />
+
+      {/* ================================
+          LOGOUT CONFIRM
+      ================================= */}
+
+      <ConfirmModal
+        open={logoutConfirmOpen}
+        title="Log out of Nudge?"
+        description="You'll be disconnected from the chat."
+        confirmLabel="Logout"
+        danger
+        onConfirm={handleLogout}
+        onCancel={() =>
+          setLogoutConfirmOpen(false)
+        }
+      />
     </div>
   );
 }
